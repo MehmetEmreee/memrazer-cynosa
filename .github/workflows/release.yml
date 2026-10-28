@@ -1,0 +1,98 @@
+name: Release
+
+# Push a tag like v1.2.0 to publish a release; run manually to get the DMG as a build artifact only.
+#
+# Signing and notarization run when these repository secrets exist; otherwise the DMG is unsigned.
+#   MACOS_CERTIFICATE           base64 of the "Developer ID Application" certificate exported as .p12
+#   MACOS_CERTIFICATE_PASSWORD  password of that .p12
+#   NOTARY_KEY                  base64 of the App Store Connect API key (.p8)
+#   NOTARY_KEY_ID               key ID of that API key
+#   NOTARY_ISSUER               issuer ID of that API key
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-15
+    env:
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "BUILD=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: swift test
+
+      - name: Import signing certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          identity="$(security find-identity -v -p codesigning "$keychain" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')"
+          [[ -n "$identity" ]] || { echo "no Developer ID Application identity in certificate" >&2; exit 1; }
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Notary key
+        if: env.HAS_NOTARY == 'true'
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8"
+            echo "NOTARY_KEY_ID=$NOTARY_KEY_ID"
+            echo "NOTARY_ISSUER=$NOTARY_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: ./scripts/build-app.sh
+
+      - name: Build DMG
+        run: ./scripts/make-dmg.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memrazer-cynosa-${{ env.VERSION }}
+          path: |
+            build/memrazer-cynosa-*.dmg
+            build/memrazer-cynosa-*.dmg.sha256
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="$(awk "/^## ${VERSION//./\\.} /{f=1;next} /^## /{f=0} f" CHANGELOG.md)"
+          if [[ "$HAS_CERT" != "true" ]]; then
+            notes+=$'\n\n> Unsigned build. First launch: right-click the app → Open. / İmzasız sürüm: ilk açılışta sağ tık → Aç.'
+          fi
+          assets=(build/memrazer-cynosa-*.dmg build/memrazer-cynosa-*.dmg.sha256)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber   # re-tagged: refresh the assets
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --title "memrazer-cynosa $VERSION" --notes "$notes"
+          fi
